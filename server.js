@@ -268,6 +268,13 @@ wss.on('connection', (ws, req) => {
                     account.name = player.name;
                     account.lastIp = ip;
                     account.lastSeen = new Date().toISOString();
+                    const mergedSkins = new Set([
+                        ...String(account.unlockedSkins || '').split('|'),
+                        ...String(msg.unlockedSkins || '').split('|')
+                    ].map(v => v.trim()).filter(Boolean));
+                    account.unlockedSkins = [...mergedSkins].join('|');
+                    const requestedSkin = String(msg.currentSkinId || '');
+                    if (requestedSkin && mergedSkins.has(requestedSkin)) account.currentSkinId = requestedSkin;
                 }
                 player.uuid = uuid;
                 player.account = account;
