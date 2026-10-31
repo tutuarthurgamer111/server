@@ -1,6 +1,9 @@
 const WebSocket = require('ws');
 const http = require('http');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
 
 const args = process.argv.slice(2);
 let port = 3000;
@@ -32,9 +35,11 @@ for (let i = 0; i < args.length; i++) {
 const WORLD_TILES = 64;
 const FOOD_COUNT  = 30;
 const COIN_COUNT  = 15;
+const APPLE_COUNT = 3;
 const STATE_RATE  = 50;
 const FOOD_RATE   = 200;
 const COIN_RATE   = 3000;
+const APPLE_RATE  = 15000;
 
 let nextId = 1;
 let heartbeatInterval = null;
@@ -43,14 +48,56 @@ let ngrokListener = null;
 const players = new Map();
 const foods   = [];
 const coins   = [];
+const apples  = [];
+
+const DATA_DIR = path.join(__dirname, 'data');
+const ACCOUNTS_FILE = path.join(DATA_DIR, 'players.json');
+let accounts = {};
+try {
+    if (fs.existsSync(ACCOUNTS_FILE)) accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')) || {};
+} catch (err) {
+    console.error('[Accounts] Could not load players.json:', err.message);
+    accounts = {};
+}
+function saveAccounts() {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = ACCOUNTS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(accounts, null, 2), 'utf8');
+    fs.renameSync(tmp, ACCOUNTS_FILE);
+}
+function sendProfile(player) {
+    if (!player.account) return;
+    send(player.ws, {
+        type: 'profile',
+        coins: player.account.coins,
+        unlockedSkins: player.account.unlockedSkins || '',
+        currentSkinId: player.account.currentSkinId || 'bright_green'
+    });
+}
+function validUuid(value) {
+    return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
 
 function log(msg) { const ts = new Date().toISOString().substring(11, 23); console.log(`[${ts}] ${msg}`); }
 function randomTile() { return { x: Math.floor(Math.random() * WORLD_TILES), y: Math.floor(Math.random() * WORLD_TILES) }; }
 function pickRarity() { const r = Math.random() * 100; if (r < 2) return 3; if (r < 10) return 2; if (r < 30) return 1; return 0; }
 function spawnFood()  { const { x, y } = randomTile(); foods.push({ x, y, rarity: pickRarity() }); }
 function spawnCoin()  { const { x, y } = randomTile(); coins.push({ x, y }); }
+function randomFreeTile() {
+    for (let attempt = 0; attempt < 500; attempt++) {
+        const pos = randomTile();
+        const occupied = foods.some(v => v.x === pos.x && v.y === pos.y) ||
+            coins.some(v => v.x === pos.x && v.y === pos.y) ||
+            apples.some(v => v.x === pos.x && v.y === pos.y) ||
+            [...players.values()].some(p => p.alive && p.body.some(seg => seg[0] === pos.x && seg[1] === pos.y));
+        if (!occupied) return pos;
+    }
+    return randomTile();
+}
+function spawnApple() { const { x, y } = randomFreeTile(); apples.push({ x, y }); }
 function ensureFoods() { while (foods.length < FOOD_COUNT) spawnFood(); }
 function ensureCoins() { while (coins.length < COIN_COUNT) spawnCoin(); }
+function ensureApples() { while (apples.length < APPLE_COUNT) spawnApple(); }
 function send(ws, obj) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
 function broadcast(obj, excludeId = -1) {
     const msg = JSON.stringify(obj);
@@ -78,6 +125,7 @@ function checkCoinEaten(hx, hy) { for (let i = 0; i < coins.length; i++) if (coi
 
 function broadcastFoods() { broadcastAll({ type: 'foods', foods: foods.map(f => [f.x, f.y, f.rarity]) }); }
 function broadcastCoins() { broadcastAll({ type: 'coin_spawn', coins: coins.map(c => [c.x, c.y]) }); }
+function broadcastApples() { broadcastAll({ type: 'apple_spawn', apples: apples.map(a => [a.x, a.y]) }); }
 
 function killPlayer(id, killer, reason) {
     const p = players.get(id); if (!p) return;
@@ -105,6 +153,7 @@ const wss = new WebSocket.Server({ server });
 
 ensureFoods();
 ensureCoins();
+ensureApples();
 
 // ─── Função de registro na API Vercel ───────────────────────────────────────
 const registerServer = async (host,targetPort) => {
@@ -184,6 +233,7 @@ wss.on('connection', (ws, req) => {
     send(ws, { type: 'welcome', id });
     send(ws, { type: 'foods', foods: foods.map(f => [f.x, f.y, f.rarity]) });
     send(ws, { type: 'coin_spawn', coins: coins.map(c => [c.x, c.y]) });
+    send(ws, { type: 'apple_spawn', apples: apples.map(a => [a.x, a.y]) });
 
     ws.on('message', raw => {
         let msg; try { msg = JSON.parse(raw); } catch { return; }
@@ -191,11 +241,43 @@ wss.on('connection', (ws, req) => {
             case 'join': {
                 player.name = String(msg.name || ('Player' + id)).substring(0, 24);
                 player.skin = String(msg.skin || 'bright_blue').substring(0, 40);
+
+                // UUID is the permanent account key. IP is recorded only as auxiliary metadata.
+                const requestedUuid = String(msg.playerId || '');
+                const uuid = validUuid(requestedUuid) ? requestedUuid.toLowerCase() : null;
+                if (!uuid) {
+                    send(ws, { type: 'error', message: 'Invalid player UUID. Update the game client.' });
+                    break;
+                }
+                let account = accounts[uuid];
+                if (!account) {
+                    const legacyCoins = Number.isSafeInteger(Number(msg.legacyCoins))
+                        ? Math.max(0, Math.min(100000000, Number(msg.legacyCoins))) : 0;
+                    account = {
+                        uuid,
+                        name: player.name,
+                        coins: legacyCoins,
+                        unlockedSkins: String(msg.unlockedSkins || '').substring(0, 2000),
+                        currentSkinId: String(msg.currentSkinId || 'bright_green').substring(0, 64),
+                        lastIp: ip,
+                        createdAt: new Date().toISOString(),
+                        lastSeen: new Date().toISOString()
+                    };
+                    accounts[uuid] = account;
+                } else {
+                    account.name = player.name;
+                    account.lastIp = ip;
+                    account.lastSeen = new Date().toISOString();
+                }
+                player.uuid = uuid;
+                player.account = account;
+                saveAccounts();
                 player.alive = true;
                 const sx = Math.floor(WORLD_TILES / 2) + Math.floor(Math.random() * 10 - 5);
                 const sy = Math.floor(WORLD_TILES / 2) + Math.floor(Math.random() * 10 - 5);
                 player.body = []; for (let i = 0; i < 4; i++) player.body.push([sx - i, sy]);
                 player.dir = [1, 0]; player.score = 0; player.coins = 0;
+                sendProfile(player);
                 log(`\x1b[34m[[game logs]] Player ${player.name} joined the Game!\x1b[0m`);
                 broadcast({ type: 'player_joined', id, name: player.name, skin: player.skin }, id);
                 break;
@@ -230,8 +312,24 @@ wss.on('connection', (ws, req) => {
                 if (ci >= 0) {
                     coins.splice(ci, 1);
                     player.coins++;
+                    if (player.account) {
+                        player.account.coins = Math.max(0, Number(player.account.coins) || 0) + 1;
+                        player.account.lastSeen = new Date().toISOString();
+                        saveAccounts(); // Persist every collected coin immediately.
+                        sendProfile(player);
+                    }
                     ensureCoins();
                     broadcastCoins();
+                }
+                break;
+            }
+            case 'apple_collect': {
+                const ax = Number(msg.x), ay = Number(msg.y);
+                const ai = apples.findIndex(a => a.x === ax && a.y === ay);
+                if (ai >= 0) {
+                    apples.splice(ai, 1);
+                    ensureApples();
+                    broadcastApples();
                 }
                 break;
             }
@@ -264,7 +362,36 @@ wss.on('connection', (ws, req) => {
 setInterval(() => { if (players.size === 0) return; broadcastAll(buildStatePayload()); }, STATE_RATE);
 setInterval(() => { if (players.size === 0) return; ensureFoods(); broadcastFoods(); }, FOOD_RATE);
 setInterval(() => { ensureCoins(); broadcastCoins(); }, COIN_RATE);
+setInterval(() => { ensureApples(); broadcastApples(); }, APPLE_RATE);
 setInterval(() => { if (players.size === 0) return; const names = [...players.values()].map(p => `${p.name}(${p.body.length})`).join(', '); log(`📊 Players: ${players.size} | ${names}`); }, 10000);
+
+// Console: givecoins "Player Name" 500 (also works when the player is offline).
+if (process.stdin.isTTY) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.on('line', line => {
+        const match = line.trim().match(/^givecoins\\s+"([^"]+)"\\s+(\\d+)$/i) ||
+                      line.trim().match(/^givecoins\\s+(\\S+)\\s+(\\d+)$/i);
+        if (!match) {
+            if (line.trim()) console.log('Use: givecoins "Player Name" 500');
+            return;
+        }
+        const targetName = match[1].trim().toLowerCase();
+        const amount = Number(match[2]);
+        if (!Number.isSafeInteger(amount) || amount < 1 || amount > 100000000) {
+            console.log('Amount must be between 1 and 100000000.');
+            return;
+        }
+        const matches = Object.values(accounts).filter(a => String(a.name || '').toLowerCase() === targetName);
+        if (matches.length === 0) { console.log('Player account not found. They must join once first.'); return; }
+        if (matches.length > 1) { console.log('More than one account has this name. Rename one player before using this command.'); return; }
+        const account = matches[0];
+        account.coins = Math.max(0, Number(account.coins) || 0) + amount;
+        account.lastSeen = new Date().toISOString();
+        saveAccounts();
+        for (const p of players.values()) if (p.uuid === account.uuid) sendProfile(p);
+        console.log('[Coins] +' + amount + ' for ' + account.name + '. New balance: ' + account.coins);
+    });
+}
 
 const cleanup = async () => {
     if (heartbeatInterval) clearInterval(heartbeatInterval);
